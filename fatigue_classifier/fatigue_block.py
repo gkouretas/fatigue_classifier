@@ -1,12 +1,19 @@
 import keras
 
+@keras.saving.register_keras_serializable()
 class FatigueLSTMBlock(keras.models.Model):
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+    
     def __init__(self, weight: float | None, mask: float | None = None, lstm_kwargs: dict = {}, conv_layers_kwargs: list[dict] | None = None, **kwargs):
         super().__init__(**kwargs)
 
         self._weight = weight
         self._mask = mask
-
+        self._lstm_kwargs = lstm_kwargs
+        self._conv_layers_kwargs = conv_layers_kwargs
+        
         if conv_layers_kwargs is not None:
             self._conv_layers: list[keras.layers.Conv1D] = []
             for conv_kwargs in conv_layers_kwargs:
@@ -57,6 +64,14 @@ class FatigueLSTMBlock(keras.models.Model):
     @property
     def output_shape(self):
         return self._output_shape
+    
+    def get_config(self):
+        return {
+            "weight": self._weight,
+            "mask": self._mask,
+            "lstm_kwargs": self._lstm_kwargs,
+            "conv_layers_kwargs": self._conv_layers_kwargs
+        }
 
     def build(self, input_shape):
         if self._conv_layers is not None:

@@ -8,6 +8,7 @@ from pathlib import Path
 from numpy.typing import NDArray
 from fatigue_classifier.fatigue_classifier.fatigue_block import FatigueLSTMBlock
 
+@keras.saving.register_keras_serializable()
 class FatigueClassifier(keras.models.Model):
     @staticmethod
     def input_signal_shape(fs: float, window_size: float, stride: float, max_duration_sec: float) -> tuple[int, int]:
@@ -18,6 +19,7 @@ class FatigueClassifier(keras.models.Model):
     
     @staticmethod
     def preprocess_signal(signal: NDArray, fs: float, window_size: float, stride: float, max_duration_sec: float, pad_value: float = 0.0):
+        # TODO(george): this fails if stride is not divisible by the window size. Add a check for this
         _size = int(fs*max_duration_sec)
         _window = int(fs*window_size)
         _stride = int(fs*stride)
@@ -40,9 +42,12 @@ class FatigueClassifier(keras.models.Model):
     
     @staticmethod
     def preprocess_labels(labels: NDArray, fs: float, window_size: float, stride: float, max_duration_sec: float, pad_value: float = 0.0):
+        # TODO(george): this fails if stride is not divisible by the window size. Add a check for this
         _size = int(fs*max_duration_sec)
         _window = int(fs*window_size)
         _stride = int(fs*stride)
+
+        print(_size, _window, _stride)
 
         _output_signal = np.zeros((labels.shape[0], int((_size-_window)/_stride)))
         for i in range(labels.shape[0]):
@@ -55,7 +60,8 @@ class FatigueClassifier(keras.models.Model):
         return _output_signal
 
     @staticmethod
-    def loss(y_true, y_pred, mask):
+    @keras.utils.register_keras_serializable()
+    def loss(y_true, y_pred, mask=0.0):
         if mask is not None:
             # Get boolean tensor where true = valid, false = invalid
             y_true_mask = tf.cast(y_true != mask, dtype=tf.float32)
@@ -72,10 +78,10 @@ class FatigueClassifier(keras.models.Model):
         if os.path.exists(path):
             model = keras.models.load_model(
                 path, 
-                custom_objects=[
-                    FatigueLSTMBlock, 
-                    FatigueClassifier.loss
-                ]
+                custom_objects={
+                    "FatigueLSTMBlock": FatigueLSTMBlock,
+                    "loss": cls.loss
+                }
             )
 
             assert isinstance(model, cls), \
@@ -84,6 +90,19 @@ class FatigueClassifier(keras.models.Model):
             return model
         else:
             raise ValueError(f"Path {path} does not exist")
+        
+    @classmethod
+    def from_config(cls, config: dict):
+        # Explicitly deserialize lstm blocks
+        # config["lstm_blocks"] = [
+        #     FatigueLSTMBlock(**keras.saving.deserialize_keras_object(x, custom_objects=FatigueLSTMBlock)) \
+        #         for x in config["lstm_blocks"]
+        # ]
+        config["lstm_blocks"] = [
+            FatigueLSTMBlock.from_config(x) for x in config["lstm_blocks"]
+        ]
+
+        return cls(**config)
 
     def __init__(self, lstm_blocks: list[FatigueLSTMBlock]):
         super().__init__()
@@ -99,6 +118,11 @@ class FatigueClassifier(keras.models.Model):
 
         self._reshape_layer: keras.layers.Concatenate | None
         self._classification_layer: keras.layers.Dense | keras.layers.Add | None
+
+    def get_config(self):
+        return {
+            "lstm_blocks": [x.get_config() for x in self._lstm_blocks]
+        }
 
     def build(self, input_shape):
         output_shapes = []
@@ -130,5 +154,6 @@ class FatigueClassifier(keras.models.Model):
 
         return self._classification_layer(x)
     
+    @keras.utils.register_keras_serializable()
     def model_loss_function(self, y_true, y_pred):
         return FatigueClassifier.loss(y_true, y_pred, self._mask)
