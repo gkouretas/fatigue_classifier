@@ -2,13 +2,22 @@ import abc
 import numpy as np
 import tensorflow as tf
 
-from fatigue_classifier.fatigue_classifier.fatigue_model import FatigueClassifier
-from typing import final, overload, TypeVar, Generic
+from fatigue_model import (
+    FatigueClassifier, 
+    InputArgs,
+    CompiledInputShape
+)
+
+from typing import final, TypeVar, Generic
 from collections import deque
 from geometry_msgs.msg import Vector3
+from numpy.typing import NDArray
 
 _SMALL_VALUE = 1e-9
 _T = TypeVar("_T")
+
+# Some helper functions
+# TODO(george): use python_utils for these
 
 def clamp(x, _min: float, _max: float):
     return np.clip(x, _min, _max)
@@ -20,27 +29,54 @@ def ffc(x, raw_buf, ffc_offset):
     return abs(x - (raw_buf[-ffc_offset] if ffc_offset <= len(raw_buf) else 0.0))
 
 class Preprocessor(abc.ABC, Generic[_T]):
-    def __init__(self, fs: float, max_duration_sec: float, window_size_sec: float, stride_sec: float, mask_value: float = 0.0):
+    """
+    Abstract base class for a fatigue model datastream.
+
+    This base class provides references for preprocessing data, which automatically reshapes the data stream to
+    the required shape of the model's input, as well as data getter and reset methods
+
+    Args:
+        input_shape (`InputArgs` | `CompiledInputShape`): Input shape metadata for datastream to the model.
+        Can be inputted as either `InputArgs`, which contains the necessary metadata to compile the input shape or a `CompiledInputShape`
+        directly.
+        mask_value (`float`, optional): Masked value to apply to unpopulated data. Defaults to 0.0.
+        resampling_factor (`float` | `None`, optional): Upsampling factor to be applied directly to the data. This should be used if the sampling frequency differs from what your model was compiled to use.
+        Defaults to None.
+
+    Raises:
+        TypeError: Raises a type error if input_shape is an invalid type.
+    """
+    @classmethod
+    def from_input_args(cls, input_args, **kwargs):
+        cls(input_shape=FatigueClassifier.input_signal_shape(input_args), **kwargs)
+
+    def __init__(self, input_shape: CompiledInputShape, mask_value: float = 0.0, resampling_factor: float | None = None):
         super().__init__()
-
-        self._fs = fs
-        self._max_duration: int = int(self._fs*max_duration_sec)
-        self._window = int(self._fs*window_size_sec)
-        self._stride = int(self._fs*stride_sec)
-
-        self._mask_value = mask_value
         
-        self._preprocessed_data: tf.Tensor = tf.expand_dims(
+        self._input_shape = input_shape
+        self._mask_value = mask_value
+
+        print(self.__class__.__name__, self._input_shape.get("shape"))
+
+        self._preprocessed_data: NDArray = np.expand_dims(
             np.ones(
-                FatigueClassifier.input_signal_shape(
-                    self._fs, window_size_sec, stride_sec, max_duration_sec
-                )
+                self._input_shape.get("shape")
             ) * mask_value, axis=0
         )
+
+        if resampling_factor < 1:
+            self._upsample = False
+            self._resampling_factor = int(1/resampling_factor)
+        elif resampling_factor > 1:
+            self._upsample = True
+            self._resampling_factor = int(resampling_factor)
+        else:
+            self._upsample = self._resampling_factor = None
 
         self._iter = 0
         self._row = 0
         self._column = 0
+        self._last_sample: np.float32 = None
 
     @final
     def preprocess(self, sample: _T):
@@ -48,12 +84,37 @@ class Preprocessor(abc.ABC, Generic[_T]):
         x = self._filter_data(sample)
 
         if x == self._mask_value: 
+            # TODO(george): log?
             # Change value slightly to not get masked
             x += _SMALL_VALUE
 
+        if self._upsample is None:
+            self._insert_sample(x)
+        elif self._upsample:
+            if self._last_sample is None:
+                for _ in range(self._resampling_factor):
+                    # Insert N duplicates of the sample
+                    self._insert_sample(x)
+            else:
+                for sample in reversed(np.linspace(
+                    x,
+                    self._last_sample,
+                    self._resampling_factor,
+                    endpoint=False
+                )):
+                    # Linearly interpolate N samples from 
+                    # last sample -> current sample
+                    self._insert_sample(sample)
+        else:
+            if ((self._iter+1) % self._resampling_factor) == 0:
+                self._insert_sample(x)
+
+    @final
+    def _insert_sample(self, x: np.float32) -> None:
         # Initialize iterators at the starting row/column
         i = self._row
         j = self._column
+
         while i < self._preprocessed_data.shape[1] and j >= 0:
             # Continue populating our tensor with preprocessed data vectors,
             # where each row is time-shifted from the previous row by the stride
@@ -68,16 +129,19 @@ class Preprocessor(abc.ABC, Generic[_T]):
             i += 1
 
             # Subtract by the stride
-            j -= self._stride
+            j -= self._input_shape.get("stride")
             
         self._iter += 1
         self._column += 1
 
-        if self._iter == self._window or \
-            (self._iter > self._window and \
-             ((self._iter - self._window) % self._stride) == 0):
+        if self._iter == self._input_shape.get("window") or \
+            (self._iter > self._input_shape.get("window") and \
+             ((self._iter - self._input_shape.get("window")) % self._input_shape.get("stride")) == 0):
+            # TODO(george): ensure row never exceeds the shape???
             self._row += 1
-            self._column -= self._stride
+            self._column -= self._input_shape.get("stride")
+
+        self._last_sample = x
 
     @property
     @final
@@ -89,8 +153,21 @@ class Preprocessor(abc.ABC, Generic[_T]):
             tf.Tensor: Tensor of shape (1, W, N), 
             where W=window size and N=samples/window
         """
-        # TODO(george): copy?
-        return self._preprocessed_data
+        return tf.convert_to_tensor(self._preprocessed_data, dtype=tf.float32)
+    
+    @property
+    @final
+    def timestep(self):
+        return self._row
+    
+    @final
+    def reset(self) -> None:
+        # Reset tensor
+        self._preprocessed_data = np.expand_dims(
+            np.ones(
+                self._input_shape.get("shape")
+            ) * self._mask_value, axis=0
+        )
     
     @abc.abstractmethod
     def _filter_data(self, sample: _T) -> np.float32:
@@ -102,9 +179,8 @@ from idl_definitions.msg import (
 )
 
 class EMGPreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
-    def __init__(self, fs, max_duration_sec, window_size_sec, stride_sec, mask_value = 0):
-        super().__init__(fs, max_duration_sec, window_size_sec, stride_sec, mask_value)
-
+    def __init__(self, input_shape: InputArgs | CompiledInputShape, mask_value = 0, resampling_factor = None):
+        super().__init__(input_shape, mask_value, resampling_factor)
         self._channel_raw_queues = [
             deque(maxlen=88) for _ in range(8)
         ]
@@ -113,13 +189,13 @@ class EMGPreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
             deque(maxlen=88) for _ in range(8)
         ]
 
-        self._ffc_offset = int(fs // 60)
+        self._ffc_offset = int(self._input_shape.get("fs") // 60)
         self._sample_index: int = None
 
     def set_sample_index(self, index: int):
         self._sample_index = index
 
-    @overload
+    
     def _filter_data(self, sample):
         assert self._sample_index is not None, \
             "Must set sample index prior to calling preprocess function"
@@ -128,24 +204,25 @@ class EMGPreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
         
         for i in range(8):
             # Iterate across 8 EMG channels
-            for dp in sample.__getattribute__(f"c{i+1}"):
-                # Apply FFC filter + full-wave rectification
-                # The low-pass filter (moving average) will be 
-                # applied at the point of analysis
+            dp = sample.__getattribute__(f"c{i+1}")
 
-                # TODO(george): review
-                # self._channel_filtered_queues[i].append(
-                #     abs(dp[self._sample_index] - (self._channel_raw_queues[i][-self._ffc_offset] if self._ffc_offset <= len(self._channel_raw_queues[i]) else 0.0))
-                # )
-                self._channel_filtered_queues[i].append(
-                    ffc(dp[self._sample_index], 
-                        self._channel_raw_queues[i], 
-                        self._ffc_offset)
-                )
+            # Apply FFC filter + full-wave rectification
+            # The low-pass filter (moving average) will be 
+            # applied at the point of analysis
 
-                self._channel_raw_queues[i].append(
-                    map(clamp(dp[self._sample_index], -5.0, 5.0), -5.0, 5.0, -1.0, 1.0)
-                )
+            # TODO(george): review
+            # self._channel_filtered_queues[i].append(
+            #     abs(dp[self._sample_index] - (self._channel_raw_queues[i][-self._ffc_offset] if self._ffc_offset <= len(self._channel_raw_queues[i]) else 0.0))
+            # )
+            self._channel_filtered_queues[i].append(
+                ffc(dp[self._sample_index], 
+                    self._channel_raw_queues[i], 
+                    self._ffc_offset)
+            )
+
+            self._channel_raw_queues[i].append(
+                map(clamp(dp[self._sample_index], -5.0, 5.0), -5.0, 5.0, -1.0, 1.0)
+            )
 
         # Reset sample index
         self._sample_index = None
@@ -157,14 +234,15 @@ class EMGPreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
         )
     
 class AccelerometerPreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
-    def __init__(self, fs, max_duration_sec, window_size_sec, stride_sec, mask_value = 0):
-        super().__init__(fs, max_duration_sec, window_size_sec, stride_sec, mask_value)
+    def __init__(self, input_shape: InputArgs | CompiledInputShape, mask_value = 0, resampling_factor = None):
+        super().__init__(input_shape, mask_value, resampling_factor)
+
         self._accel_channels = [deque(maxlen=8) for _ in range(3)]
 
     def set_sample_index(self, index: int):
         self._sample_index = index
 
-    @overload
+    
     def _filter_data(self, sample):
         assert self._sample_index is not None, \
             "Must set sample index prior to calling preprocess function"
@@ -188,14 +266,15 @@ class AccelerometerPreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
         ) - 1.0
     
 class GyroscopePreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
-    def __init__(self, fs, max_duration_sec, window_size_sec, stride_sec, mask_value = 0):
-        super().__init__(fs, max_duration_sec, window_size_sec, stride_sec, mask_value)
+    def __init__(self, input_shape: InputArgs | CompiledInputShape, mask_value = 0, resampling_factor = None):
+        super().__init__(input_shape, mask_value, resampling_factor)
+        
         self._accel_channels = [deque(maxlen=8) for _ in range(3)]
 
     def set_sample_index(self, index: int):
         self._sample_index = index
 
-    @overload
+    
     def _filter_data(self, sample):
         assert self._sample_index is not None, \
             "Must set sample index prior to calling preprocess function"
@@ -220,20 +299,22 @@ class GyroscopePreprocessor(Preprocessor[MindroveArmBandEightChannelMsg]):
     
 from scipy.signal import find_peaks
 class ECGPreprocessor(Preprocessor[PluxMsg]):
-    def __init__(self, fs, max_duration_sec, window_size_sec, stride_sec, mask_value = 0, ecg_window_sec: float = 5.0, min_peaks_for_initial_estimate: int = 5):
-        super().__init__(fs, max_duration_sec, window_size_sec, stride_sec, mask_value)
+    def __init__(self, input_shape: InputArgs | CompiledInputShape, mask_value = 0, resampling_factor = None, ecg_window_sec: float = 5.0, min_peaks_for_initial_estimate: int = 5):
+        super().__init__(input_shape, mask_value, resampling_factor)    
+        self._fs = self._input_shape.get("fs")
+        self._ffc_offset = int(self._fs // 60)
         
-        self._ffc_offset = int(fs // 60)
-        
+        # TODO: compute from fs
         self._ecg_raw_queue = deque(maxlen=176)
         self._ecg_preprocessed_queue = deque(maxlen=176)
-        self._ecg_filtered_queue = deque(maxlen=int(fs*min_peaks_for_initial_estimate))
+        self._ecg_filtered_queue = deque(maxlen=int(self._fs*min_peaks_for_initial_estimate))
         self._bpm_queue = deque(maxlen=176)
         self._initial_bpm_found = False
 
         self._ecg_window_sec = ecg_window_sec
         self._min_peaks_for_initial_estimate = min_peaks_for_initial_estimate
 
+    
     def _filter_data(self, sample):
         self._ecg_preprocessed_queue.append(
             ffc(sample.ecg, self._ecg_raw_queue, self._ffc_offset)

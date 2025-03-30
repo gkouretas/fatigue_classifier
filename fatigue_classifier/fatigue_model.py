@@ -6,39 +6,62 @@ import os
 from pathlib import Path
 
 from numpy.typing import NDArray
-from fatigue_classifier.fatigue_classifier.fatigue_block import FatigueLSTMBlock
+from fatigue_block import FatigueLSTMBlock
+from typing import TypedDict
+
+class CompiledInputShape(TypedDict):
+    fs: float
+    max_duration_sec: float # TODO(george): remove?
+
+    size: int
+    window: int
+    stride: int
+    shape: tuple[int, int]
+    
+class InputArgs(TypedDict):
+    fs: float
+    window_size_sec: float
+    stride_sec: float
+    max_duration_sec: float
 
 @keras.saving.register_keras_serializable()
 class FatigueClassifier(keras.models.Model):
     @staticmethod
-    def input_signal_shape(fs: float, window_size: float, stride: float, max_duration_sec: float) -> tuple[int, int]:
-        _size = int(fs*max_duration_sec)
-        _window = int(fs*window_size)
-        _stride = int(fs*stride)
-        return int((_size-_window)/_stride), _window
+    def input_signal_shape(args: InputArgs) -> CompiledInputShape:
+        print(args)
+        _size = int(args.get("fs")*args.get("max_duration_sec"))
+        _window = int(args.get("fs")*args.get("window_size_sec"))
+        _stride = int(args.get("fs")*args.get("stride_sec"))
+
+        return CompiledInputShape(
+            fs=args.get("fs"),
+            max_duration_sec=args.get("max_duration_sec"),
+            size=_size,
+            window=_window,
+            stride=_stride,
+            shape=(int((_size-_window)/_stride), _window)
+        )
     
     @staticmethod
-    def preprocess_signal(signal: NDArray, fs: float, window_size: float, stride: float, max_duration_sec: float, pad_value: float = 0.0):
-        # TODO(george): this fails if stride is not divisible by the window size. Add a check for this
-        _size = int(fs*max_duration_sec)
-        _window = int(fs*window_size)
-        _stride = int(fs*stride)
-
-        _output_signal = np.zeros((signal.shape[0], int((_size-_window)/_stride), _window))
+    def preprocess_signal(signal: NDArray, args: InputArgs, pad_value: float = 0.0):
+        # TODO(george): this fails if stride is not divisible by the window size. 
+        # Add a check for this
+        _input_shape = FatigueClassifier.input_signal_shape(args)
+        _output_signal = np.zeros((signal.shape[0], _input_shape.get("shape")[0], _input_shape.get("shape")[1]))
         
         for i in range(signal.shape[0]):
-            for j, k in enumerate(range(0, _size-_window, _stride)):
+            for j, k in enumerate(range(0, _input_shape.get("size")-_input_shape.get("window"), _input_shape.get("stride"))):
                 if k >= signal[i].size:
-                    _output_signal[i][j] = np.ones(shape = (1, _window)) * pad_value
-                elif k+_window >= signal[i].size:
+                    _output_signal[i][j] = np.ones(shape = (1, _input_shape.get("window"))) * pad_value
+                elif k+_input_shape.get("window") >= signal[i].size:
                     _output_signal[i][j] = np.concatenate(
-                        [np.array(signal[i][k:signal[i].size]).reshape((1, signal[i][k:signal[i].size].size)), np.ones(shape = (1, _window-(signal[i].size-k))) * pad_value],
+                        [np.array(signal[i][k:signal[i].size]).reshape((1, signal[i][k:signal[i].size].size)), np.ones(shape = (1, _input_shape.get("window")-(signal[i].size-k))) * pad_value],
                         axis = 1
                     )
                 else:
-                    _output_signal[i][j] = signal[i][k:k+_window]
+                    _output_signal[i][j] = signal[i][k:k+_input_shape.get("window")]
 
-        return _output_signal
+        return _output_signal, _input_shape
     
     @staticmethod
     def preprocess_labels(labels: NDArray, fs: float, window_size: float, stride: float, max_duration_sec: float, pad_value: float = 0.0):
@@ -46,8 +69,6 @@ class FatigueClassifier(keras.models.Model):
         _size = int(fs*max_duration_sec)
         _window = int(fs*window_size)
         _stride = int(fs*stride)
-
-        print(_size, _window, _stride)
 
         _output_signal = np.zeros((labels.shape[0], int((_size-_window)/_stride)))
         for i in range(labels.shape[0]):
@@ -94,19 +115,18 @@ class FatigueClassifier(keras.models.Model):
     @classmethod
     def from_config(cls, config: dict):
         # Explicitly deserialize lstm blocks
-        # config["lstm_blocks"] = [
-        #     FatigueLSTMBlock(**keras.saving.deserialize_keras_object(x, custom_objects=FatigueLSTMBlock)) \
-        #         for x in config["lstm_blocks"]
-        # ]
         config["lstm_blocks"] = [
             FatigueLSTMBlock.from_config(x) for x in config["lstm_blocks"]
         ]
 
         return cls(**config)
 
-    def __init__(self, lstm_blocks: list[FatigueLSTMBlock]):
-        super().__init__()
+    def __init__(self, lstm_blocks: list[FatigueLSTMBlock], input_shapes: list[CompiledInputShape] | None = None, **kwargs):
+        self._kwargs = kwargs
+        super().__init__(**kwargs)
+        
         self._lstm_blocks = lstm_blocks
+        self._input_shapes = input_shapes
         
         assert all(x.weight is None for x in self._lstm_blocks) or np.sum([x.weight for x in lstm_blocks]) == 1.0, \
             "Sum of the weights must be equal to 1.0, or weights must all be None"
@@ -119,15 +139,37 @@ class FatigueClassifier(keras.models.Model):
         self._reshape_layer: keras.layers.Concatenate | None
         self._classification_layer: keras.layers.Dense | keras.layers.Add | None
 
+    def get_input_shape(self, name_substring: str) -> tuple[int, CompiledInputShape] | tuple[None, None]:
+        if self._input_shapes is None: return None
+
+        for i, block in enumerate(self._lstm_blocks):
+            if name_substring in block.name: return i, self._input_shapes[i]
+
+        return None, None
+
     def get_config(self):
-        return {
-            "lstm_blocks": [x.get_config() for x in self._lstm_blocks]
+        config = {
+            "lstm_blocks": [x.get_config() for x in self._lstm_blocks],
+            "input_shapes": self._input_shapes
         }
 
-    def build(self, input_shape):
+        config.update(self._kwargs)
+        return config
+
+    def build(self, input_shape):                
         output_shapes = []
         for lstm_block, input_vector in zip(self._lstm_blocks, input_shape):
             output_shapes.append(lstm_block.compute_output_shape(input_vector))
+
+        if self._input_shapes is not None:
+            assert len(self._lstm_blocks) == len(self._input_shapes), \
+                f"Mismatch in lengths of LSTM blocks and input shapes ({len(self._lstm_blocks)} != {len(self._input_shapes)})"
+
+            for block, input_shape_actual, input_shape_expected in zip(self._lstm_blocks, input_shape, self._input_shapes):
+                # Assert shape is equivalent. Ignore first element (batch size)
+                assert block.input_shape[1:] == input_shape_actual[1:] == input_shape_expected.get("shape"), \
+                    f"Mismatch in input shape ({block.input_shape[1:]} != {input_shape_actual} != {input_shape_expected.get('shape')})"
+
 
         if not self._hard_coded_weights:
             # Concatenate LSTM blocks

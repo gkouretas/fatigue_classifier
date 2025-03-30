@@ -7,6 +7,7 @@ class FatigueLSTMBlock(keras.models.Model):
         return cls(**config)
     
     def __init__(self, weight: float | None, mask: float | None = None, lstm_kwargs: dict = {}, conv_layers_kwargs: list[dict] | None = None, **kwargs):
+        self._kwargs = kwargs
         super().__init__(**kwargs)
 
         self._weight = weight
@@ -42,6 +43,7 @@ class FatigueLSTMBlock(keras.models.Model):
                 lambda x: x * self._weight
             )
 
+        self._input_shape = None
         self._output_shape = None
         self._last_pred = None
     
@@ -62,18 +64,29 @@ class FatigueLSTMBlock(keras.models.Model):
         return self._classification_layer
     
     @property
+    def input_shape(self):
+        return self._input_shape
+    
+    @property
     def output_shape(self):
         return self._output_shape
     
     def get_config(self):
-        return {
+        config = {
             "weight": self._weight,
             "mask": self._mask,
             "lstm_kwargs": self._lstm_kwargs,
             "conv_layers_kwargs": self._conv_layers_kwargs
         }
 
+        # Include any keyword arguments that were passed
+        config.update(self._kwargs)
+
+        return config
+
     def build(self, input_shape):
+        self._input_shape = input_shape
+
         if self._conv_layers is not None:
             for conv_layer in self._conv_layers:
                 conv_layer.build(input_shape)
