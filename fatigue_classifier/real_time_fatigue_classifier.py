@@ -16,14 +16,19 @@ from fatigue_preprocessor import (
 from fatigue_classifier_configs import *
 
 from idl_definitions.msg import (
+    ExerciseState,
+    FatigueState,
     MindroveArmBandEightChannelMsg,
     PluxMsg,
     UserInputMsg
 )
 
-from python_utils.ros2_utils.comms.node_manager import get_realtime_qos_profile
+from fatigue_experiment_control.fatigue_experiment_control_configs import (
+    FATIGUE_EXPERIMENT_CONTROL_TOPIC_NAME,
+    FATIGUE_QOS_PROFILE
+)
 
-from std_msgs.msg import Float32
+from python_utils.ros2_utils.comms.node_manager import get_realtime_qos_profile
 
 from typing import TypeVar
 
@@ -34,7 +39,7 @@ class RealtimeFatigueClassifier:
         self._node = node
         self._model = FatigueClassifier.from_file(path)
         self._lock = threading.Lock()
-        self._ordered_preprocessors: list[_T] = [None for _ in range(4)]
+        self._ordered_preprocessors: list[_T | None] = [None for _ in range(4)]
 
         try:
             # Data pre-processors
@@ -69,10 +74,9 @@ class RealtimeFatigueClassifier:
         assert all(self._ordered_preprocessors)
 
         self._ready = False
-        self._last_prediction: Float32 = Float32(data=0.0)
+        self._last_prediction: float = 0.0
         self._current_timestep: int = 0
 
-        self._last_user_status: UserInputMsg | None = None
         self._user_status: UserInputMsg | None = None
 
         # Sampling rate = 500 Hz for EMG and 50 Hz for IMU
@@ -101,8 +105,15 @@ class RealtimeFatigueClassifier:
             get_realtime_qos_profile()
         )
 
+        self._exercise_state_subscriber = self._node.create_subscription(
+            ExerciseState,
+            FATIGUE_EXPERIMENT_CONTROL_TOPIC_NAME,
+            self.update_exercise_state,
+            get_realtime_qos_profile()
+        )
+
         self._fatigue_publisher = self._node.create_publisher(
-            Float32,
+            FatigueState,
             FATIGUE_OUTPUT_TOPIC_NAME,
             get_realtime_qos_profile()
         )
@@ -111,14 +122,6 @@ class RealtimeFatigueClassifier:
             FATIGUE_PREDICTION_RATE, 
             self.predict_fatigue
         )
-
-        # TODO(george): move to decoder
-        # from ur10e_custom_control.ur10e_typedefs import URService
-        # self._ur_speed_scaling_service = URService.init_service(
-        #     self._node,
-        #     URService.IOAndStatusController.SRV_SET_FORCE_MODE_PARAMS,
-        #     timeout = 10
-        # )
 
     def _init_preprocessor(self, fs: float, name_substr: str, preprocessor_cls: type[_T], **preprocessor_kwargs) -> _T:
         input_loc, input_shape = self._model.get_input_shape(name_substr)
@@ -176,41 +179,31 @@ class RealtimeFatigueClassifier:
             self._ecg_preprocessor.preprocess(msg)
 
     def update_sensed_fatigue(self, msg: UserInputMsg):
-        self._node.get_logger().debug("Received user input packet")
+        with self._lock:
+            self._user_status = msg
 
-        if not self._lock.acquire(timeout=1):
-            self._node.get_logger().warning("Lock timed out")
-            
-        self._last_user_status = self._user_status
-        self._user_status = msg
-        
-        if self._last_user_status is not None:
-            state_changed = (self._last_user_status.is_active != self._user_status.is_active)
-        else:
-            state_changed = False
+    def update_exercise_state(self, msg: ExerciseState):
+        with self._lock:
+            last_state = self._ready
+            self._ready = (msg.state == ExerciseState.ACTIVE)
 
-        if state_changed or self._last_user_status is None:
-            if self._user_status.is_active:
-                self._node.get_logger().info("User is active, starting predictions")
+            if last_state != self._ready:
+                if self._ready:
+                    self._node.get_logger().info("User is active, starting predictions")
 
-                # Enable predictions
-                self._ready = True
-                self._lock.release()
+                    # Enable predictions
+                    self._ready = True
 
-                # Reset prediction timer
-                self._prediction_timer.reset()
-            else:
-                # Disable updates
-                self._ready = False
+                    # Reset prediction timer
+                    self._prediction_timer.reset()
+                else:
+                    self._node.get_logger().info("User not active, resetting")
 
-                # Clear the preprocessor buffers
-                self._clear_buffers()
+                    # Disable updates
+                    self._ready = False
 
-                self._lock.release()
-        else:
-            self._lock.release()
-
-        self._node.get_logger().debug("Exiting")
+                    # Clear the preprocessor buffers
+                    self._clear_buffers()
 
     def predict_fatigue(self):
         self._node.get_logger().debug("Predicting fatigue")
@@ -227,9 +220,14 @@ class RealtimeFatigueClassifier:
             self._node.get_logger().info(f"Output: {prediction}")
 
             # prediction: (1, T, 1)
-            self._last_prediction.data = float(tf.squeeze(prediction)[ts])
+            self._last_prediction = float(tf.squeeze(prediction)[ts])
 
-            self._fatigue_publisher.publish(self._last_prediction)
+            # Publish the fatigue state
+            # Divide the fatigue percentage by 100 so both are on a normalized 0-1 scale
+            self._fatigue_publisher.publish(
+                FatigueState(predicted=self._last_prediction, 
+                             actual=self._user_status.fatigue_percentage / 100.0)
+            )
         else:
             self._lock.release()
 
