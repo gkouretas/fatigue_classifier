@@ -1,5 +1,6 @@
 import tensorflow as tf
 import threading
+import rclpy
 
 from rclpy.node import Node
 from pathlib import Path
@@ -185,10 +186,10 @@ class RealtimeFatigueClassifier:
     def update_exercise_state(self, msg: ExerciseState):
         with self._lock:
             last_state = self._ready
-            self._ready = (msg.state == ExerciseState.ACTIVE)
+            current_state = (msg.state == ExerciseState.ACTIVE)
 
-            if last_state != self._ready:
-                if self._ready:
+            if last_state != current_state:
+                if current_state:
                     self._node.get_logger().info("User is active, starting predictions")
 
                     # Enable predictions
@@ -217,10 +218,10 @@ class RealtimeFatigueClassifier:
             self._lock.release()
 
             prediction = self._model.call(inputs)
-            self._node.get_logger().info(f"Output: {prediction}")
 
             # prediction: (1, T, 1)
             self._last_prediction = float(tf.squeeze(prediction)[ts])
+            self._node.get_logger().info(f"Output: {self._last_prediction}")
 
             # Publish the fatigue state
             # Divide the fatigue percentage by 100 so both are on a normalized 0-1 scale
@@ -241,3 +242,10 @@ class RealtimeFatigueClassifier:
                     self._accelerometer_preprocessor, 
                     self._gyroscope_preprocessor, 
                     self._ecg_preprocessor)])
+    
+def main():
+    rclpy.init()
+    node = Node(node_name="fatigue_classifier")
+    classifier = RealtimeFatigueClassifier(node=node, path=Path("fatigue_model.keras"))
+    
+    rclpy.spin(node)

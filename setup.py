@@ -21,7 +21,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            f'sim = {package_name}.scripts.real_time_fatigue_simulator:main'
+            f'sim = {package_name}.scripts.real_time_fatigue_simulator:main',
+            f'real_classifier = {package_name}.real_time_fatigue_classifier:main'
         ],
     },
 )
