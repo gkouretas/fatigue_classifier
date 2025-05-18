@@ -64,7 +64,7 @@ class RealtimeFatigueClassifier:
             )
 
             self._ecg_preprocessor = self._init_preprocessor(
-                fs=1000.0,
+                fs=PLUX_SAMPLING_FREQUENCY,
                 name_substr="hr",
                 preprocessor_cls=ECGPreprocessor
             )

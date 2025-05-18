@@ -335,7 +335,7 @@ class ECGPreprocessor(Preprocessor[PluxMsg]):
             # TODO(george): error?
             return 0.0
 
-        self._bpm_queue.append(clamp(x, 30.0, 220.0), 30.0, 220.0, 0.0, 1.0)
+        self._bpm_queue.append(map(clamp(x, 30.0, 220.0), 30.0, 220.0, 0.0, 1.0))
         
         # Moving average of BPM
         return np.average(self._bpm_queue)

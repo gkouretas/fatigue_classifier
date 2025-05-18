@@ -5,7 +5,8 @@ from ros2_mindrove.mindrove_configs import (
 
 from ros2_plux_biosignals.plux_configs import (
     PLUX_ROS_NODE,
-    PLUX_ROS_TOPIC_NAME
+    PLUX_ROS_TOPIC_NAME,
+    PLUX_SAMPLING_FREQUENCY
 )
 
 from pi_user_input_node.user_input_node_config import (
