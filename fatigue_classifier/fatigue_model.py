@@ -64,11 +64,11 @@ class FatigueClassifier(keras.models.Model):
         return _output_signal, _input_shape
     
     @staticmethod
-    def preprocess_labels(labels: NDArray, fs: float, window_size: float, stride: float, max_duration_sec: float, pad_value: float = 0.0):
+    def preprocess_labels(labels: NDArray, args: InputArgs, pad_value: float = 0.0):
         # TODO(george): this fails if stride is not divisible by the window size. Add a check for this
-        _size = int(fs*max_duration_sec)
-        _window = int(fs*window_size)
-        _stride = int(fs*stride)
+        _size = int(args.get("fs")*args.get("max_duration_sec"))
+        _window = int(args.get("fs")*args.get("window_size_sec"))
+        _stride = int(args.get("fs")*args.get("stride_sec"))
 
         _output_signal = np.zeros((labels.shape[0], int((_size-_window)/_stride)))
         for i in range(labels.shape[0]):
